@@ -2,53 +2,140 @@
 <launch>
     <!-- The planning and execution components of MoveIt! configured to run -->
     <!-- using the ROS-Industrial interface. -->
+    <!-- The .launch file is tailored for ROS Melodic, removing various deprecation warnings  -->
 
-    <!-- | 		PARAMETERS  		| -->
+    <!-- |          PARAMETERS          | -->
+    <arg name="pkg_name" default="MRC_2021"/>
     <!-- hardware_interface to use : PositionJointInterface, EffortJointInterface, VelocityJointInterface. -->
     <arg name="hardware_interface" default="PositionJointInterface"/>
     <!-- The is gonna have its nodes/topics under a namespace with the same name. -->
     <arg name="robot_name" default="iiwa"/>
     <!-- Model of the iiwa to use : iiwa7, iiwa14 -->
     <arg name="model" default="iiwa14"/>
-    <arg name="rviz" default="true" />
+    <arg name="rviz" default="false" />
+    <!-- Robot model spawn pose, passed to xacro. Note the syntax to pass a vector -->
+    <arg name="origin_xyz" default="'0 0 0'"/> 
+    <arg name="origin_rpy" default="'0 0 0'"/>
+    <!-- Controller settings -->
+    <arg name="joint_state_frequency" default="100" />
+    <arg name="robot_state_frequency" default="100" /> 
+    <!-- Move Group settings -->
+    <arg name="fake_execution" default="false"/>
+    <arg name="max_safe_path_cost" default="1"/>
+    <arg name="jiggle_fraction" default="0.05" />
 
-    <!-- Some quick and dirty remaps for things that are less convenient to launch under the correct namespace -->
-    <remap from="/$(arg hardware_interface)_trajectory_controller/follow_joint_trajectory"
-           to="/$(arg robot_name)/$(arg hardware_interface)_trajectory_controller/follow_joint_trajectory" />
-    <remap from="/robot_description" to="/$(arg robot_name)/robot_description" />
-    <remap from="/get_planning_scene" to="/$(arg robot_name)/get_planning_scene" />
 
-    <!-- Load Gazebo with given values -->
-    <include file="$(find iiwa_gazebo)/launch/iiwa_world.launch">
-        <arg name="hardware_interface" value="$(arg hardware_interface)" />
-        <arg name="robot_name" value="$(arg robot_name)" />
-        <arg name="model" value="$(arg model)" />
+    <!-- |          GAZEBO              | -->
+    <!-- Loads the iiwa.world environment in Gazebo. -->  
+    <!-- We resume the logic in empty_world.launch, changing only the name of the world to be launched -->
+    <include file="$(find gazebo_ros)/launch/empty_world.launch">
+        <arg name="world_name" value="$(eval find(arg('pkg_name')) + '/world/iiwa.world')"/>  
+        <!-- Misc Gazebo settings -->
+        <arg name="paused" default="false"/>
+        <arg name="use_sim_time" default="true"/>
+        <arg name="gui" default="true"/>
+        <arg name="headless" default="false"/>
+        <!-- Debug won't work unless built from source with GDB support -->
+        <arg name="debug" default="false"/>
     </include>
     
-    <!-- Spawn controllers - it uses a JointTrajectoryController -->
+    <!-- Load the URDF with the given hardware interface into the ROS Parameter Server -->
+    <param name="$(arg robot_name)/robot_description" 
+        command="$(find xacro)/xacro '$(find iiwa_description)/urdf/iiwa14.urdf.xacro' 
+        hardware_interface:=$(arg hardware_interface) robot_name:=$(arg robot_name) 
+        origin_xyz:=$(arg origin_xyz) origin_rpy:=$(arg origin_rpy)"/>
+  
+    <!-- Run a Python script to send a service call to gazebo_ros to spawn a URDF robot -->
+    <node name="urdf_spawner" pkg="gazebo_ros" type="spawn_model" respawn="false" 
+        output="screen" args="-urdf -model $(arg robot_name) 
+        -param $(arg robot_name)/robot_description -robot_namespace $(arg robot_name)"/>
+
+
+    <!-- |          CONTROLLERS         | -->
+    <!-- Spawn controllers - it uses a JointTrajectoryController hardware interface -->
+    <!-- Everythings is spawned under a namespace with the same name as the robot's. -->    
     <group  ns="$(arg robot_name)" >
-        <!-- Adding PID seems to break things -->
-        <!-- <rosparam file="$(find MRC_2021)/config/iiwa_sim_pid.yaml" command="load"/> -->
-        <include file="$(find iiwa_control)/launch/iiwa_control.launch">
-            <arg name="hardware_interface" value="$(arg hardware_interface)" />
-            <arg name="controllers" value="joint_state_controller $(arg hardware_interface)_trajectory_controller" />
-            <arg name="robot_name" value="$(arg robot_name)" />
-            <arg name="model" value="$(arg model)" />
-        </include>
+        <!-- The following line is disabled until correct PID values are found for the simulated model -->
+        <!-- <rosparam file="$(eval find(arg('pkg_name')))/config/iiwa_sim_pid.yaml" command="load"/> -->
+
+        <!-- Loads joint controller configurations from YAML file to parameter server -->
+        <rosparam file="$(eval find(arg('pkg_name')) + '/config/iiwa_control.yaml')" command="load" />
+        <rosparam file="$(eval find(arg('pkg_name')) + '/config/iiwa_kinematics_solver.yaml')" command="load" />
+        <param name="/$(arg robot_name)/joint_state_controller/publish_rate" value="$(arg joint_state_frequency)" />
+
+        <!-- Loads the controllers -->
+        <node name="controller_spawner" pkg="controller_manager" type="spawner" respawn="false" 
+            output="screen" args="joint_state_controller $(arg hardware_interface)_trajectory_controller" />
+
+        <!-- Converts joint states to TF transforms for rviz, etc -->
+        <node name="robot_state_publisher" pkg="robot_state_publisher" 
+            type="robot_state_publisher" respawn="false" output="screen">
+            <param name="publish_frequency" value="$(arg robot_state_frequency)" />
+        </node>
     </group>
-      
-    <!-- Load move_group -->
+
+
+    <!-- |          MOVE GROUP          | -->
     <group ns="$(arg robot_name)">
-        <include file="$(find iiwa_moveit)/launch/move_group.launch">
-            <arg name="publish_monitored_planning_scene" value="true" />
-            <arg name="hardware_interface" value="$(arg hardware_interface)"/>
-            <arg name="robot_name" value="$(arg robot_name)"/>
-            <arg name="model" value="$(arg model)" />
+        <!-- Load semantic description that corresponds to the URDF -->
+        <param name="robot_description_semantic" 
+            textfile="$(eval find(arg('pkg_name')) + '/config/' + arg('model') + '.srdf')" />
+        <!-- Load updated joint limits (override information from URDF) -->
+        <rosparam ns="robot_description_planning" command="load" 
+            file="$(eval find(arg('pkg_name')) + '/config/joint_limits.yaml')"/>
+        <!-- Load default settings for kinematics; these settings are overridden by settings in a node's namespace -->
+        <rosparam ns="robot_description_kinematics" command="load" 
+            file="$(eval find(arg('pkg_name')) + '/config/iiwa_kinematics_solver.yaml')"/>
+
+        <!-- Planning Functionality -->
+        <include ns="move_group" file="$(find iiwa_moveit)/launch/planning_pipeline.launch.xml">
+            <arg name="pipeline" value="ompl" />
         </include>
 
-        <include if="$(arg rviz)" file="$(find iiwa_moveit)/launch/moveit_rviz.launch">
-            <arg name="config" value="true"/>
+        <!-- Trajectory Execution Functionality -->
+        <include ns="move_group" file="$(find iiwa_moveit)/launch/trajectory_execution.launch.xml">
+            <arg name="moveit_manage_controllers" value="true" />
+            <arg name="moveit_controller_manager" value="iiwa" unless="$(arg fake_execution)"/>
+            <arg name="moveit_controller_manager" value="fake" if="$(arg fake_execution)"/>
+            <arg name="hardware_interface" value="$(arg hardware_interface)"/>
         </include>
+
+        <!-- Sensors Functionality -->
+        <include ns="move_group" file="$(find iiwa_moveit)/launch/sensor_manager.launch.xml">
+            <arg name="moveit_sensor_manager" value="iiwa" />
+        </include>
+
+        <!-- Start the actual move_group node/action server -->
+        <node name="move_group" pkg="moveit_ros_move_group" type="move_group" 
+            respawn="false" output="screen">
+            <!-- Set the display variable, in case OpenGL code is used internally -->
+            <env name="DISPLAY" value="$(optenv DISPLAY :0)" />
+
+            <param name="allow_trajectory_execution" value="true"/>
+            <param name="max_safe_path_cost" value="$(arg max_safe_path_cost)"/>
+            <param name="jiggle_fraction" value="$(arg jiggle_fraction)" />
+
+            <!-- MoveGroup capabilities to load -->
+            <param name="capabilities" 
+                 value="move_group/MoveGroupCartesianPathService
+                        move_group/MoveGroupExecuteTrajectoryAction
+                        move_group/MoveGroupKinematicsService
+                        move_group/MoveGroupMoveAction
+                        move_group/MoveGroupPickPlaceAction
+                        move_group/MoveGroupPlanService
+                        move_group/MoveGroupQueryPlannersService
+                        move_group/MoveGroupStateValidationService
+                        move_group/MoveGroupGetPlanningSceneService
+                        move_group/ClearOctomapService
+                        " />
+        </node>
     </group>
+
+
+    <!-- |          RVIZ                | -->
+    <node ns="$(arg robot_name)" name="$(anon rviz)" pkg="rviz" type="rviz" 
+        respawn="false" output="screen" 
+        args="$(eval '-d ' + find(arg('pkg_name')) + '/rviz/iiwa_moveit.rviz')" >
+    </node>
 
 </launch>
